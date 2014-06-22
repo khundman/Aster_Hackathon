@@ -1,0 +1,175 @@
+// Data Exploration
+select * from public.amazon order by prod_id desc limit 25;
+
+select count(*),prod_id from public.amazon  group by prod_id order by count(*) desc limit 25;
+
+select * from public.amazon where prod_id = 'B009SA5NNW';
+select count(*) from public.amazon;
+select count(distinct prod_id) from public.amazon;
+select count(*),prod_id from public.amazon  group by prod_id having count(*) >= 15; 
+
+select prod_id, rank() OVER (partition  by prod_id order by time_val) from public.amazon where prod_id = 'B000STZRTW';
+
+select prod_id, rank() OVER (partition  by prod_id order by time_val) from public.amazon limit 1000;
+
+select *,length(summary) from public.amazon limit 100;
+
+// *******************************************************
+// Subset to look at products with > 15 reviews
+create table public.t8_amazon15 distribute by hash (prod_id) as
+select count(*),prod_id from public.amazon  group by prod_id having count(*) >= 15 ; 
+
+// Add some simple stats
+create table public.t8_amazon15plus distribute by hash (prod_id) as
+select *,length(summary) as summary_length, rank() OVER (partition  by prod_id order by time_val) as rank from public.amazon where prod_id in (select prod_id from public.t8_amazon15);
+
+// Get unique words
+drop table public.t8_amazon15words
+create table public.t8_amazon15words distribute by hash (prod_id) as
+select * from text_parser (
+    ON public.t8_amazon15plus
+    text_column ('summary')
+    case_insensitive('true')
+    accumulate('prod_id','uid')
+) ;
+
+// Process unique words
+drop table public.t8_amazon15uniquewords;
+create table public.t8_amazon15uniquewords distribute by hash(prod_id) as
+    select prod_id, uid, count(distinct token) as unique_words from public.t8_amazon15words  group by prod_id, uid order by prod_id, uid;
+
+// Get unique punctuation
+drop table public.t8_amazon15punctuation;
+create table public.t8_amazon15punctuation distribute by hash (prod_id) as
+select * from text_parser (
+    ON public.t8_amazon15plus
+    text_column ('summary')
+    case_insensitive('true')
+    punctuation('[a-z]+')
+    accumulate('prod_id','uid')
+) ;
+
+// Process unique punctuation
+update public.t8_amazon15punctuation set token = null where token not in ('.',',','!','?',';',':','"','(',')','''');
+drop table public.t8_amazon15uniquepunct
+create table public.t8_amazon15uniquepunct distribute by hash(prod_id) as
+    select prod_id, uid, count(distinct token) as unique_punct from public.t8_amazon15punctuation  group by prod_id, uid order by prod_id, uid;
+
+// split out helpful into two columns
+drop table public.t8_amazon15reviewstats;
+create table public.t8_amazon15reviewstats distribute by hash(prod_id) as
+    select prod_id, uid, helpful, substring(helpful from 0 for position('/' in helpful)) as cnt_helpful
+    ,substring(helpful from position('/' in helpful)+1 for 5)  as cnt_review_rating
+    from public.t8_amazon15plus
+    order by prod_id, uid;
+
+// Check the tables before joining
+select * from public.amazon where prod_id = '0006641040';
+select * from public.t8_amazon15 where prod_id = '0006641040';
+select * from public.t8_amazon15plus where prod_id = '0006641040';
+select * from public.t8_amazon15words where prod_id = '0006641040';
+select * from public.t8_amazon15uniquewords where prod_id = '0006641040' order by uid;
+select * from public.t8_amazon15uniquepunct where prod_id = '0006641040' order by uid;
+select * from public.t8_amazon15reviewstats2 where prod_id = '0006641040' order by uid;
+select count(distinct prod_id) from public.amazon;
+select count(distinct prod_id) from public.t8_amazon15;
+select count(distinct prod_id) from public.t8_amazon15plus;
+select count(distinct prod_id) from public.t8_amazon15uniqueword;
+select count(distinct prod_id) from public.t8_amazon15uniquepunct;
+select count(distinct prod_id) from public.t8_amazon15reviewstats;
+
+// Create cnt_unhelpful, perc_helpful
+drop table public.t8_amazon15reviewstats2;
+create table public.t8_amazon15reviewstats2 distribute by hash(prod_id) as
+    select *, (cast(cnt_review_rating as INTEGER) - cast(cnt_helpful as INTEGER)) as cnt_unhelpful,
+    CASE when cnt_review_rating = '0' then 0
+    ELSE 
+         (cast(cnt_helpful as FLOAT) / cast(cnt_review_rating as FLOAT))
+        END as perc_helpful
+ from public.t8_amazon15reviewstats
+    order by prod_id, uid;
+
+
+// Join into one final set
+create table public.t8_amazon15final distribute by hash(prod_id) as
+SELECT a.*, b.unique_words, c.unique_punct, d.cnt_helpful, d.cnt_review_rating, d.cnt_unhelpful, d.perc_helpful
+FROM public.t8_amazon15plus as a INNER JOIN public.t8_amazon15uniquewords as b ON a.prod_id = b.prod_id AND a.uid = b.uid
+    INNER JOIN public.t8_amazon15uniquepunct as c ON a.prod_id = c.prod_id AND a.uid = c.uid INNER JOIN public.t8_amazon15reviewstats2 as d
+    ON a.prod_id = d.prod_id AND a.uid = d.uid
+ORDER BY a.prod_id, a.uid;
+
+CREATE TABLE public.t8_amazon15final2 distribute by hash(prod_id) as 
+SELECT prod_id, uid, uid_name, helpful, (cast(score as FLOAT)) as score, time_val, title, summary, summary_length, rank, unique_words, unique_punct,
+    (cast(cnt_helpful as INTEGER)) as cnt_helpful, (cast(cnt_review_rating as INTEGER)) as cnt_review_rating, cnt_unhelpful, perc_helpful
+FROM public.t8_amazon15final;
+
+select * from public.t8_amazon15final order by prod_id, uid LIMIT 200;
+
+drop table public.amazon15test ;
+create table public.amazon15test distribute by hash(prod_id) as
+SELECT * from sample(
+    ON public.t8_amazon15final2
+    SAMPLEFRACTION(.33));
+
+drop table public.amazon15train ;
+create table public.amazon15train distribute by hash(prod_id) as 
+SELECT * from public.t8_amazon15final2
+EXCEPT
+SELECT * from public.amazon15test;
+
+SELECT count(*) from public.t8_amazon15final;
+SELECT count(*) from public.amazon15test;
+SELECT count(*) from public.amazon15train;
+
+//Forest
+SELECT * FROM forest_drive (
+    ON (SELECT 1)
+    PARTITION BY 1
+    PASSWORD('db_superuser')
+    USERID('db_superuser')
+    INPUTTABLE ('public.amazon15train')
+    OUTPUTTABLE('public.amazon15drive_train')
+    RESPONSE('cnt_helpful')
+    NUMERICINPUTS('unique_words','unique_punct','summary_length','score','rank')
+);
+
+//visualize tree
+SELECT *
+FROM GraphGen(
+    ON (select tree,1 cnt from public.amazon15drive_train limit 1)
+PARTITION BY 1
+ITEM_FORMAT('dtree')
+ITEM1_COL('tree')
+SCORE_COL('cnt')
+OUTPUT_FORMAT('tree')
+    TITLE('Decision Treehouse')
+);
+
+CREATE TABLE public.amazon15predict distribute by hash(id) as
+SELECT * FROM forest_predict (
+    ON public.amazon15test2
+    FOREST('public.amazon15drive_train')
+    IDCOL('id')
+    PASSWORD('db_superuser')
+    USERID('db_superuser')
+    NUMERICINPUTS('unique_words','unique_punct','summary_length','score','rank')
+);
+
+
+CREATE TABLE public.amazon15test2 distribute by hash(prod_id) as
+SELECT *, (prod_id || '_' || uid) as id
+FROM public.amazon15test;
+
+select * from public.amazon15results LIMIT 200;
+
+CREATE TABLE public.amazon15results distribute by hash(id) as 
+SELECT a.*, round(cast(b.prediction as FLOAT)) as prediction
+FROM public.amazon15test2 as a INNER JOIN public.amazon15predict as b ON a.id = b.id;
+
+//CREATE TABLE public.amazon15resultsSD distribute by hash(id) as
+SELECT id, (stddev(cnt_helpful - prediction)) as error_SD
+FROM public.amazon15results
+GROUP BY id;
+
+SELECT sqrt((sum((cnt_helpful - prediction)*(cnt_helpful - prediction)))/count(*)) as SD
+FROM public.amazon15results;
